@@ -11,9 +11,9 @@ plotly>=5.0.0
 matplotlib>=3.6.0
 
 # ML & NLP
-torch>=2.0.0
-transformers>=4.30.0
-scikit-learn>=1.3.0
+# Model BERT dijalankan di HuggingFace Inference API, bukan lokal --
+# jadi torch & transformers TIDAK dibutuhkan lagi di server Streamlit.
+huggingface_hub>=0.24.0
 
 # File Handling
 openpyxl>=3.1.5 

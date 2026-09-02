@@ -9,7 +9,7 @@ import plotly.express as px
 from typing import Dict, List, Tuple, Optional
 import os
 
-from inference import run_inference, InvalidTokopediaURLError, ReviewsNotFoundError
+from inference import run_inference, InvalidTokopediaURLError, ReviewsNotFoundError, ScraperUnavailableError
 from utils import model_weights_available
 
 # ======================================================================
@@ -431,7 +431,7 @@ if st.session_state.analysis_results:
                 plot_bgcolor='rgba(0,0,0,0)',
                 font=dict(color='#E3E3E3', size=12)
             )
-            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False}, key="pie_aspect_distribution")
 
     with col2:
         st.markdown('<div class="chart-title">Distribusi Sentimen Total</div>', unsafe_allow_html=True)
@@ -456,7 +456,7 @@ if st.session_state.analysis_results:
                 plot_bgcolor='rgba(0,0,0,0)',
                 font=dict(color='#E3E3E3', size=12)
             )
-            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False}, key="pie_sentiment_distribution")
 
     # ========== BARIS 3: SEBARAN SENTIMEN PER ASPEK (plot langsung, tanpa card) ==========
     st.markdown('<div class="chart-title">Sebaran Sentimen per Aspek</div>', unsafe_allow_html=True)
@@ -487,7 +487,7 @@ if st.session_state.analysis_results:
             yaxis=dict(color='#E3E3E3'),
             font=dict(color='#E3E3E3', size=12)
         )
-        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False}, key="bar_sentiment_per_aspect")
 
     # ========== BARIS 4: DETAIL ULASAN PER ASPEK ==========
     st.markdown('<h3 style="margin-top: 30px; margin-bottom: 20px;">Detail Ulasan per Aspek</h3>', unsafe_allow_html=True)
@@ -549,7 +549,7 @@ if st.session_state.analysis_results:
                     plot_bgcolor='rgba(0,0,0,0)',
                     font=dict(color='#E3E3E3', size=10)
                 )
-                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False}, key=f"donut_aspect_{aspect_idx}")
 
     # ========== TUTUP RESULT CONTAINER ==========
     st.markdown('</div>', unsafe_allow_html=True)
@@ -631,6 +631,9 @@ if pesan_user:
         except ReviewsNotFoundError:
             status.update(label="Ulasan tidak ditemukan", state="error")
             st.error("Mohon maaf, ulasan tidak berhasil didapatkan.")
+        except ScraperUnavailableError as e:
+            status.update(label="Layanan scraping tidak tersedia", state="error")
+            st.error(str(e))
         except FileNotFoundError:
             status.update(label="Bobot model tidak ditemukan", state="error")
             st.error(f"Bobot model {pilihan_model} belum tersedia di folder model/.")

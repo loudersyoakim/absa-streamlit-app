@@ -12,29 +12,48 @@ from datetime import datetime
 from typing import Callable, Optional, Dict, List, Any, Union
 from urllib.parse import urlparse, unquote
 
-import torch
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from huggingface_hub import hf_hub_download
 
 from utils import ASPECTS
 
-MODEL_DIR = "model"
-MODEL_PATHS = {
+# Ganti dengan repo HuggingFace kamu sendiri (format "username/nama-repo").
+HF_MODEL_REPOS = {
     "IndoBERT": {
-        "ACD": os.path.join(MODEL_DIR, "indobert_acd", "best_model"),
-        "ASC": os.path.join(MODEL_DIR, "indobert_asc", "best_model"),
+        "ACD": "Louders/ABSA-IndoBERT-ACD",
+        "ASC": "Louders/ABSA-IndoBERT-ASC",
     },
     "mBERT": {
-        "ACD": os.path.join(MODEL_DIR, "mbert_acd", "best_model"),
-        "ASC": os.path.join(MODEL_DIR, "mbert_asc", "best_model"),
+        "ACD": "Louders/ABSA-mBERT-ACD",
+        "ASC": "Louders/ABSA-mBERT-ASC",
     },
 }
+# Isi HF_TOKEN di Settings -> Secrets (Streamlit Cloud). Wajib diisi karena
+# HF Inference API butuh token (bahkan untuk repo publik, kalau tidak nanti
+# kena rate limit ketat / ditolak).
+HF_TOKEN = st.secrets.get("HF_TOKEN", None) if hasattr(st, "secrets") else None
+
+# Endpoint HF Inference API (serverless). Model harus tetap "warm"/ke-load
+# di sisi HuggingFace saat dipanggil -- bukan lagi di proses Streamlit ini,
+# jadi RAM Streamlit tidak lagi dipakai untuk nyimpen bobot model.
+HF_INFERENCE_API_URL = "https://api-inference.huggingface.co/models/{repo_id}"
+
 MODEL_KEY_ALIASES = {"IndoBERT": "indobert", "mBERT": "mbert"}
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ProgressFn = Optional[Callable[[str], None]]
 DEFAULT_THRESHOLD = 0.5
+
+# Nilai cadangan kalau label_maps.json / acd_optimal_thresholds.json belum
+# diupload ke repo HuggingFace (lihat Sub-bab 4.4.3 & 4.4.4 skripsi).
+FALLBACK_LABEL_MAPS = {
+    "aspect_labels": ["A1", "A2", "A3", "B1", "B2", "B3", "C1", "C2", "D1"],
+    "sentiment_labels": ["Negatif", "Netral", "Positif"],
+}
+FALLBACK_ACD_THRESHOLDS = {
+    "indobert": {"threshold": 0.45},
+    "mbert": {"threshold": 0.30},
+}
 
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -51,42 +70,122 @@ class ReviewsNotFoundError(Exception):
     pass
 
 
+class HFInferenceError(Exception):
+    """Dilempar kalau HuggingFace Inference API gagal merespons dengan benar
+    (token salah, repo tidak ditemukan, model masih loading lalu timeout, dll)."""
+    pass
+
+
+# ScraperUnavailableError didefinisikan di dekat _build_driver() di bawah
+
+
 def _noop(_msg: str) -> None:
     return None
 
 
 @st.cache_resource(show_spinner=False)
 def load_label_maps() -> dict:
-    path = os.path.join(MODEL_DIR, "label_maps.json")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        path = hf_hub_download(
+            repo_id=HF_MODEL_REPOS["IndoBERT"]["ASC"],
+            filename="label_maps.json",
+            token=HF_TOKEN,
+        )
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return FALLBACK_LABEL_MAPS
 
 
-@st.cache_resource(show_spinner=False)
-def load_models(model_choice: str):
-    paths = MODEL_PATHS[model_choice]
+def _hf_infer(repo_id: str, text: str, timeout: int = 40) -> List[Dict[str, Any]]:
+    """Panggil HF Inference API untuk satu model text-classification dan
+    kembalikan skor semua label, mis. [{"label": "A1", "score": 0.82}, ...].
 
-    tokenizer_acd = AutoTokenizer.from_pretrained(paths["ACD"])
-    model_acd = AutoModelForSequenceClassification.from_pretrained(paths["ACD"]).to(DEVICE)
-    model_acd.eval()
+    - `wait_for_model: True` supaya kalau model lagi "cold" (belum di-load
+      di sisi HuggingFace), request menunggu daripada langsung gagal 503.
+    - `top_k: None` supaya semua label dikembalikan sekaligus skornya, bukan
+      cuma yang paling tinggi -- dibutuhkan untuk ACD yang multi-label.
+    """
+    if not HF_TOKEN:
+        raise HFInferenceError(
+            "HF_TOKEN belum diisi. Tambahkan di Settings -> Secrets Streamlit Cloud."
+        )
 
-    tokenizer_asc = AutoTokenizer.from_pretrained(paths["ASC"])
-    model_asc = AutoModelForSequenceClassification.from_pretrained(paths["ASC"]).to(DEVICE)
-    model_asc.eval()
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    payload = {
+        "inputs": text,
+        "parameters": {"top_k": None},
+        "options": {"wait_for_model": True, "use_cache": False},
+    }
 
-    return tokenizer_acd, model_acd, tokenizer_asc, model_asc
+    try:
+        resp = requests.post(
+            HF_INFERENCE_API_URL.format(repo_id=repo_id),
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+        )
+    except requests.RequestException as e:
+        raise HFInferenceError(f"Gagal menghubungi HuggingFace Inference API untuk {repo_id}: {e}") from e
+
+    if resp.status_code != 200:
+        raise HFInferenceError(
+            f"HuggingFace Inference API mengembalikan status {resp.status_code} untuk {repo_id}: {resp.text[:300]}"
+        )
+
+    data = resp.json()
+    if isinstance(data, dict) and "error" in data:
+        raise HFInferenceError(f"Error dari HuggingFace Inference API ({repo_id}): {data['error']}")
+
+    # Respons text-classification biasanya list-of-list: [[{label,score},...]]
+    if isinstance(data, list) and data and isinstance(data[0], list):
+        data = data[0]
+
+    if not isinstance(data, list):
+        raise HFInferenceError(f"Format respons tidak dikenal dari {repo_id}: {data}")
+
+    return data
+
+
+def _label_lookup(scores: List[Dict[str, Any]], canonical_labels: List[str]) -> Dict[str, float]:
+    """Petakan label hasil API ke kode kanonis (A1, A2, ... / Positif, dst).
+
+    Model yang sudah punya `id2label` terisi benar akan mengembalikan label
+    aslinya (mis. "A1"). Kalau model masih pakai default HF ("LABEL_0",
+    "LABEL_1", ...), kita jatuhkan ke urutan `canonical_labels` sesuai index.
+    """
+    result: Dict[str, float] = {}
+    for item in scores:
+        label = str(item.get("label", ""))
+        score = float(item.get("score", 0.0))
+        if label in canonical_labels:
+            result[label] = score
+            continue
+        m = re.match(r"^LABEL_(\d+)$", label)
+        if m:
+            idx = int(m.group(1))
+            if 0 <= idx < len(canonical_labels):
+                result[canonical_labels[idx]] = score
+                continue
+        # Label tidak dikenal sama sekali -- simpan apa adanya untuk debugging.
+        result[label] = score
+    return result
 
 
 @st.cache_resource(show_spinner=False)
 def load_acd_threshold(model_choice: str) -> float:
-    path = os.path.join(MODEL_DIR, "acd_optimal_thresholds.json")
     key = MODEL_KEY_ALIASES.get(model_choice, model_choice.lower())
     try:
+        path = hf_hub_download(
+            repo_id=HF_MODEL_REPOS[model_choice]["ACD"],
+            filename="acd_optimal_thresholds.json",
+            token=HF_TOKEN,
+        )
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return float(data[key]["threshold"])
-    except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError):
-        return DEFAULT_THRESHOLD
+    except Exception:
+        return FALLBACK_ACD_THRESHOLDS.get(key, {}).get("threshold", DEFAULT_THRESHOLD)
 
 
 def get_model_info(model_type: str) -> Dict[str, Any]:
@@ -112,29 +211,34 @@ def _empty_result_shell(model_choice: str, source_preview: str) -> dict:
     }
 
 
-def _analyze_single(text: str, tok_acd, mod_acd, tok_asc, mod_asc, maps: dict, threshold: float) -> dict:
+def _analyze_single(text: str, model_choice: str, maps: dict, threshold: float) -> dict:
+    """Jalankan ACD lalu ASC lewat HF Inference API (tanpa model lokal).
+
+    Catatan penting: supaya ACD berperilaku multi-label (sigmoid per label,
+    bukan softmax satu pemenang), config.json repo ACD di HuggingFace harus
+    berisi `"problem_type": "multi_label_classification"` -- ini yang
+    membuat pipeline text-classification bawaan HF Inference API otomatis
+    memakai sigmoid, persis seperti training-nya.
+    """
+    repos = HF_MODEL_REPOS[model_choice]
     aspect_labels = maps["aspect_labels"]
     sentiment_labels = maps["sentiment_labels"]
-    id2sent = {i: lbl for i, lbl in enumerate(sentiment_labels)}
 
-    inputs_acd = tok_acd(text, return_tensors="pt", truncation=True, max_length=128).to(DEVICE)
-    with torch.no_grad():
-        logits_acd = mod_acd(**inputs_acd).logits
-        probs_acd = torch.sigmoid(logits_acd).squeeze(0).cpu().tolist()
+    acd_scores = _hf_infer(repos["ACD"], text)
+    acd_by_label = _label_lookup(acd_scores, aspect_labels)
 
-    if isinstance(probs_acd, float):
-        probs_acd = [probs_acd]
+    detected = [code for code in aspect_labels if acd_by_label.get(code, 0.0) >= threshold]
 
-    detected = [aspect_labels[i] for i, p in enumerate(probs_acd) if p >= threshold and i < len(aspect_labels)]
-
-    per_aspect_sentiment = {}
+    per_aspect_sentiment: Dict[str, str] = {}
     for aspect in detected:
         asc_input = f"{aspect} {text}"
-        inputs_asc = tok_asc(asc_input, return_tensors="pt", truncation=True, max_length=128).to(DEVICE)
-        with torch.no_grad():
-            logits_asc = mod_asc(**inputs_asc).logits
-            pred_idx = int(torch.argmax(logits_asc, dim=1).item())
-        per_aspect_sentiment[aspect] = id2sent.get(pred_idx, "Netral")
+        asc_scores = _hf_infer(repos["ASC"], asc_input)
+        asc_by_label = _label_lookup(asc_scores, sentiment_labels)
+        if asc_by_label:
+            best_label = max(asc_by_label, key=asc_by_label.get)
+        else:
+            best_label = "Netral"
+        per_aspect_sentiment[aspect] = best_label if best_label in sentiment_labels else "Netral"
 
     return per_aspect_sentiment
 
@@ -154,8 +258,7 @@ def analyze_texts_local(
 
     source_preview = source_label or texts[0]
 
-    progress(f"Memuat model {model_choice}")
-    tok_acd, mod_acd, tok_asc, mod_asc = load_models(model_choice)
+    progress(f"Menghubungi model {model_choice} di HuggingFace")
     maps = load_label_maps()
 
     aspects_result: dict[str, dict] = {}
@@ -163,7 +266,7 @@ def analyze_texts_local(
 
     progress("Model sedang mendeteksi aspek yang dibahas dalam ulasan")
     for text in texts:
-        per_aspect_sentiment = _analyze_single(text, tok_acd, mod_acd, tok_asc, mod_asc, maps, threshold)
+        per_aspect_sentiment = _analyze_single(text, model_choice, maps, threshold)
 
         for aspect, sent_label in per_aspect_sentiment.items():
             bucket = aspects_result.setdefault(
@@ -251,10 +354,13 @@ def _is_valid_tokopedia_product_url(url: str) -> bool:
     return len(path_parts) >= 2
 
 
+class ScraperUnavailableError(Exception):
+    pass
+
+
 def _build_driver():
     from selenium import webdriver
     from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
 
     options = webdriver.ChromeOptions()
     options.add_argument("--headless=new")
@@ -264,10 +370,24 @@ def _build_driver():
     options.add_argument("--window-size=1366,1000")
     options.add_argument(f"user-agent={REQUEST_HEADERS['User-Agent']}")
 
+    chromium_bin = os.environ.get("CHROMIUM_BIN", "/usr/bin/chromium")
+    chromedriver_bin = os.environ.get("CHROMEDRIVER_BIN", "/usr/bin/chromedriver")
+
+    if os.path.exists(chromium_bin):
+        options.binary_location = chromium_bin
+
     try:
-        return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        if os.path.exists(chromedriver_bin):
+            service = Service(executable_path=chromedriver_bin)
+        else:
+            from webdriver_manager.chrome import ChromeDriverManager
+            service = Service(ChromeDriverManager().install())
+        return webdriver.Chrome(service=service, options=options)
     except Exception as e:
-        raise InvalidTokopediaURLError("URL yang diinput tidak valid.") from e
+        raise ScraperUnavailableError(
+            f"Browser scraping tidak tersedia di server ini ({e}). "
+            f"Pastikan chromium & chromium-driver terpasang (lihat packages.txt)."
+        ) from e
 
 
 def _extract_reviews_from_page_source(html: str) -> List[str]:

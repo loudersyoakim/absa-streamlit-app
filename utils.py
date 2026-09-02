@@ -70,10 +70,12 @@ MODEL_INFO: Dict[str, Dict[str, Any]] = {
 
 
 def model_weights_available(model_choice: str) -> bool:
-    key = "indobert" if model_choice == "IndoBERT" else "mbert"
-    acd_dir = os.path.join(MODEL_DIR, f"{key}_acd", "best_model")
-    asc_dir = os.path.join(MODEL_DIR, f"{key}_asc", "best_model")
-    return os.path.isdir(acd_dir) and os.path.isdir(asc_dir)
+    """Inferensi sekarang dijalankan lewat HuggingFace Inference API (bukan
+    model lokal), jadi ketersediaannya baru benar-benar diperiksa saat
+    inference._hf_infer() dipanggil (butuh HF_TOKEN valid & repo bisa
+    diakses). Fungsi ini dipertahankan untuk kompatibilitas pemanggil lama
+    dan selalu True di sini."""
+    return True
 
 
 def truncate_text(text: str, max_length: int = 50, suffix: str = "...") -> str:
