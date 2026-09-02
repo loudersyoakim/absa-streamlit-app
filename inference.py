@@ -287,20 +287,6 @@ def _extract_reviews_from_page_source(html: str) -> List[str]:
 
 
 def scrape_tokopedia_reviews(url: str) -> tuple[List[str], str]:
-    """
-    Scraping ulasan sungguhan pakai headless Chrome, karena Tokopedia
-    memuat ulasan lewat JavaScript setelah tab "Ulasan" diklik dan
-    halamannya di-scroll -- bukan ada di HTML mentah. Dibuat "keras":
-    tiap langkah yang rawan gagal (buka halaman, tutup popup, klik tab,
-    klik halaman berikutnya) di-retry beberapa kali sebelum menyerah,
-    dan paginasi terus jalan sampai benar-benar tidak ada ulasan baru
-    lagi atau tombol halaman berikutnya sudah tidak aktif.
-
-    Mengembalikan (daftar_ulasan, nama_produk). Nama produk diambil dari
-    <h1 data-testid="lblPDPDetailProductName"> yang sudah ada di HTML
-    awal (bukan hasil lazy-load), jadi bisa diambil segera setelah
-    halaman terbuka, sebelum urusan klik tab ulasan.
-    """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC

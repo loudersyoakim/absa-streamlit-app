@@ -1,34 +1,3 @@
-"""
-CATATAN REVISI (satu-satunya blok komentar panjang di seluruh project):
-- Semua hasil di halaman ini berasal dari run_inference() di inference.py,
-  memanggil model IndoBERT/mBERT sungguhan. Tidak ada lagi data contoh.
-- Sidebar tidak lagi punya riwayat percakapan. Tombol "Percakapan Baru"
-  mereset seluruh state dan kembali ke layar awal.
-- Mode "URL Tokopedia" melakukan scraping sungguhan lewat
-  scrape_tokopedia_reviews() di inference.py. Kalau URL-nya tidak bisa
-  dibuka sama sekali, pesannya "URL yang diinput tidak valid." Kalau
-  halamannya kebuka tapi ulasan tidak ditemukan, pesannya "Mohon maaf,
-  ulasan tidak berhasil didapatkan."
-- Progres analisis ditampilkan bertahap lewat st.status, tiap tahap
-  ditahan minimal 1 detik supaya semua pesan sempat terbaca pengguna.
-- Kartu ringkasan sekarang "Aspek Paling Sering Dibahas" (kiri) dan
-  "Aspek Paling Sering Dikeluhkan" (kanan), bukan lagi berbasis rasio
-  positif/negatif yang bisa menyoroti aspek "Umum" secara tidak wajar.
-- Chart distribusi & sebaran sentimen tidak lagi dibungkus card, langsung
-  ditampilkan sebagai plot dengan tinggi yang lebih besar. Legend pie
-  dipindah ke samping (bukan bawah) dengan domain pie dikunci eksplisit,
-  supaya ukuran lingkaran kedua chart selalu sama besar berapa pun
-  jumlah item legend-nya -- ini sempat jadi bug (chart dengan legend
-  lebih banyak baris jadi lebih kecil), sudah diverifikasi dengan
-  render langsung sebelum dan sesudah perbaikan.
-- Detail ulasan per aspek dibatasi 3 per kategori sentimen, dengan
-  tombol "Lihat selengkapnya" untuk membuka daftar penuh.
-- Judul "ABSA - <Model>" dan baris "<Metode Input> - <judul ulasan>"
-  sekarang ditampilkan paling atas halaman hasil. Judul ulasan diambil
-  dari 5 kata pertama input (mode Teks/Upload File) atau nama produk
-  hasil ekstraksi halaman Tokopedia (mode URL Tokopedia).
-"""
-
 import streamlit as st
 import pandas as pd
 import json
