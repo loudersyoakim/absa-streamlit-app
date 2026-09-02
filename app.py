@@ -9,7 +9,13 @@ import plotly.express as px
 from typing import Dict, List, Tuple, Optional
 import os
 
-from inference import run_inference, InvalidTokopediaURLError, ReviewsNotFoundError, ScraperUnavailableError
+from inference import (
+    run_inference,
+    InvalidTokopediaURLError,
+    ReviewsNotFoundError,
+    ScraperUnavailableError,
+    ModelLoadError,
+)
 from utils import model_weights_available
 
 # ======================================================================
@@ -633,6 +639,9 @@ if pesan_user:
             st.error("Mohon maaf, ulasan tidak berhasil didapatkan.")
         except ScraperUnavailableError as e:
             status.update(label="Layanan scraping tidak tersedia", state="error")
+            st.error(str(e))
+        except ModelLoadError as e:
+            status.update(label="Gagal memuat model", state="error")
             st.error(str(e))
         except FileNotFoundError:
             status.update(label="Bobot model tidak ditemukan", state="error")

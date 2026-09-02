@@ -1,7 +1,3 @@
-"""
-inference.py -- pipeline ABSA (ACD -> ASC) memakai IndoBERT/mBERT hasil
-fine-tuning, plus parsing input dan scraping ulasan Tokopedia.
-"""
 from __future__ import annotations
 
 import os
@@ -12,33 +8,36 @@ from datetime import datetime
 from typing import Callable, Optional, Dict, List, Any, Union
 from urllib.parse import urlparse, unquote
 
+import torch
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 from huggingface_hub import hf_hub_download
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 from utils import ASPECTS
 
-# Ganti dengan repo HuggingFace kamu sendiri (format "username/nama-repo").
+# HuggingFace di sini cuma dipakai sebagai penyimpanan bobot model (dan
+# file label_maps.json / acd_optimal_thresholds.json) -- model tetap
+# di-download lalu dijalankan LOKAL di proses Streamlit ini, bukan lewat
+# Inference API/Space eksternal.
 HF_MODEL_REPOS = {
     "IndoBERT": {
-        "ACD": "Louders/ABSA-IndoBERT-ACD",
-        "ASC": "Louders/ABSA-IndoBERT-ASC",
+        "ACD": "loudersyoakim/absa-indobert-acd",
+        "ASC": "loudersyoakim/absa-indobert-asc",
     },
     "mBERT": {
-        "ACD": "Louders/ABSA-mBERT-ACD",
-        "ASC": "Louders/ABSA-mBERT-ASC",
+        "ACD": "loudersyoakim/absa-mbert-acd",
+        "ASC": "loudersyoakim/absa-mbert-asc",
     },
 }
-# Isi HF_TOKEN di Settings -> Secrets (Streamlit Cloud). Wajib diisi karena
-# HF Inference API butuh token (bahkan untuk repo publik, kalau tidak nanti
-# kena rate limit ketat / ditolak).
+# Isi HF_TOKEN di Settings -> Secrets Streamlit Cloud kalau repo model private.
 HF_TOKEN = st.secrets.get("HF_TOKEN", None) if hasattr(st, "secrets") else None
 
-# Endpoint HF Inference API (serverless). Model harus tetap "warm"/ke-load
-# di sisi HuggingFace saat dipanggil -- bukan lagi di proses Streamlit ini,
-# jadi RAM Streamlit tidak lagi dipakai untuk nyimpen bobot model.
-HF_INFERENCE_API_URL = "https://api-inference.huggingface.co/models/{repo_id}"
+MODEL_KEY_ALIASES = {"IndoBERT": "indobert", "mBERT": "mbert"}
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ProgressFn = Optional[Callable[[str], None]]
+DEFAULT_THRESHOLD = 0.5
 
 MODEL_KEY_ALIASES = {"IndoBERT": "indobert", "mBERT": "mbert"}
 ProgressFn = Optional[Callable[[str], None]]
@@ -70,9 +69,9 @@ class ReviewsNotFoundError(Exception):
     pass
 
 
-class HFInferenceError(Exception):
-    """Dilempar kalau HuggingFace Inference API gagal merespons dengan benar
-    (token salah, repo tidak ditemukan, model masih loading lalu timeout, dll)."""
+class ModelLoadError(Exception):
+    """Dilempar kalau model gagal di-download/di-load dari HuggingFace
+    (repo tidak ditemukan, token salah untuk repo private, dsb.)."""
     pass
 
 
@@ -97,79 +96,92 @@ def load_label_maps() -> dict:
         return FALLBACK_LABEL_MAPS
 
 
-def _hf_infer(repo_id: str, text: str, timeout: int = 40) -> List[Dict[str, Any]]:
-    """Panggil HF Inference API untuk satu model text-classification dan
-    kembalikan skor semua label, mis. [{"label": "A1", "score": 0.82}, ...].
+import gc
+import threading
 
-    - `wait_for_model: True` supaya kalau model lagi "cold" (belum di-load
-      di sisi HuggingFace), request menunggu daripada langsung gagal 503.
-    - `top_k: None` supaya semua label dikembalikan sekaligus skornya, bukan
-      cuma yang paling tinggi -- dibutuhkan untuk ACD yang multi-label.
-    """
-    if not HF_TOKEN:
-        raise HFInferenceError(
-            "HF_TOKEN belum diisi. Tambahkan di Settings -> Secrets Streamlit Cloud."
-        )
+# --------------------------------------------------------------------------
+# Manajemen model: cuma SATU model (IndoBERT atau mBERT) yang boleh ada di
+# RAM dalam satu waktu. Ini penting karena tiap model (ACD+ASC) beratnya
+# ratusan MB -- kalau dua-duanya dibiarkan nyangkut di memori sekaligus,
+# server gratisan (RAM terbatas) bisa crash/restart.
+#
+# @st.cache_resource TIDAK dipakai di sini secara langsung untuk model,
+# karena cache itu menyimpan SETIAP kombinasi argumen yang pernah dipanggil
+# (jadi kalau user gonta-ganti IndoBERT <-> mBERT, keduanya tetap nyangkut
+# di cache dan tidak pernah di-unload). Sebagai gantinya, kita simpan
+# manual satu slot model aktif ("_ACTIVE"), dan setiap kali model yang
+# diminta beda dari yang sedang aktif, model lama di-hapus dulu dari
+# memori (del + gc.collect()) sebelum model baru di-download/di-load.
+# --------------------------------------------------------------------------
+_MODEL_LOCK = threading.Lock()
+_ACTIVE: Dict[str, Any] = {
+    "model_choice": None,
+    "tok_acd": None, "mod_acd": None,
+    "tok_asc": None, "mod_asc": None,
+}
 
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    payload = {
-        "inputs": text,
-        "parameters": {"top_k": None},
-        "options": {"wait_for_model": True, "use_cache": False},
-    }
+
+def _unload_active_model() -> None:
+    """Hapus model yang sedang aktif dari memori (kalau ada)."""
+    if _ACTIVE["model_choice"] is None:
+        return
+    _ACTIVE["tok_acd"] = None
+    _ACTIVE["mod_acd"] = None
+    _ACTIVE["tok_asc"] = None
+    _ACTIVE["mod_asc"] = None
+    _ACTIVE["model_choice"] = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _download_model(model_choice: str, progress: "ProgressFn" = None):
+    """Download & load satu model (ACD+ASC) dari HuggingFace ke memori lokal."""
+    progress = progress or _noop
+    repos = HF_MODEL_REPOS[model_choice]
 
     try:
-        resp = requests.post(
-            HF_INFERENCE_API_URL.format(repo_id=repo_id),
-            headers=headers,
-            json=payload,
-            timeout=timeout,
-        )
-    except requests.RequestException as e:
-        raise HFInferenceError(f"Gagal menghubungi HuggingFace Inference API untuk {repo_id}: {e}") from e
+        progress(f"Mengunduh {model_choice} ACD dari HuggingFace")
+        tokenizer_acd = AutoTokenizer.from_pretrained(repos["ACD"], token=HF_TOKEN)
+        model_acd = AutoModelForSequenceClassification.from_pretrained(repos["ACD"], token=HF_TOKEN).to(DEVICE)
+        model_acd.eval()
 
-    if resp.status_code != 200:
-        raise HFInferenceError(
-            f"HuggingFace Inference API mengembalikan status {resp.status_code} untuk {repo_id}: {resp.text[:300]}"
-        )
+        progress(f"Mengunduh {model_choice} ASC dari HuggingFace")
+        tokenizer_asc = AutoTokenizer.from_pretrained(repos["ASC"], token=HF_TOKEN)
+        model_asc = AutoModelForSequenceClassification.from_pretrained(repos["ASC"], token=HF_TOKEN).to(DEVICE)
+        model_asc.eval()
+    except Exception as e:
+        raise ModelLoadError(
+            f"Gagal memuat model {model_choice} dari HuggingFace ({repos}): {e}"
+        ) from e
 
-    data = resp.json()
-    if isinstance(data, dict) and "error" in data:
-        raise HFInferenceError(f"Error dari HuggingFace Inference API ({repo_id}): {data['error']}")
-
-    # Respons text-classification biasanya list-of-list: [[{label,score},...]]
-    if isinstance(data, list) and data and isinstance(data[0], list):
-        data = data[0]
-
-    if not isinstance(data, list):
-        raise HFInferenceError(f"Format respons tidak dikenal dari {repo_id}: {data}")
-
-    return data
+    return tokenizer_acd, model_acd, tokenizer_asc, model_asc
 
 
-def _label_lookup(scores: List[Dict[str, Any]], canonical_labels: List[str]) -> Dict[str, float]:
-    """Petakan label hasil API ke kode kanonis (A1, A2, ... / Positif, dst).
-
-    Model yang sudah punya `id2label` terisi benar akan mengembalikan label
-    aslinya (mis. "A1"). Kalau model masih pakai default HF ("LABEL_0",
-    "LABEL_1", ...), kita jatuhkan ke urutan `canonical_labels` sesuai index.
+def get_models(model_choice: str, progress: "ProgressFn" = None):
+    """Pastikan model `model_choice` aktif di memori. Kalau model lain
+    sedang aktif (user baru saja ganti pilihan di sidebar), model lama
+    di-unload dulu sebelum model baru dimuat -- jadi RAM cuma menampung
+    satu model sekaligus.
     """
-    result: Dict[str, float] = {}
-    for item in scores:
-        label = str(item.get("label", ""))
-        score = float(item.get("score", 0.0))
-        if label in canonical_labels:
-            result[label] = score
-            continue
-        m = re.match(r"^LABEL_(\d+)$", label)
-        if m:
-            idx = int(m.group(1))
-            if 0 <= idx < len(canonical_labels):
-                result[canonical_labels[idx]] = score
-                continue
-        # Label tidak dikenal sama sekali -- simpan apa adanya untuk debugging.
-        result[label] = score
-    return result
+    progress = progress or _noop
+    with _MODEL_LOCK:
+        if _ACTIVE["model_choice"] == model_choice:
+            return _ACTIVE["tok_acd"], _ACTIVE["mod_acd"], _ACTIVE["tok_asc"], _ACTIVE["mod_asc"]
+
+        if _ACTIVE["model_choice"] is not None:
+            progress(f"Melepas model {_ACTIVE['model_choice']} dari memori sebelum ganti ke {model_choice}")
+            _unload_active_model()
+
+        tok_acd, mod_acd, tok_asc, mod_asc = _download_model(model_choice, progress)
+
+        _ACTIVE["model_choice"] = model_choice
+        _ACTIVE["tok_acd"] = tok_acd
+        _ACTIVE["mod_acd"] = mod_acd
+        _ACTIVE["tok_asc"] = tok_asc
+        _ACTIVE["mod_asc"] = mod_asc
+
+        return tok_acd, mod_acd, tok_asc, mod_asc
 
 
 @st.cache_resource(show_spinner=False)
@@ -211,34 +223,29 @@ def _empty_result_shell(model_choice: str, source_preview: str) -> dict:
     }
 
 
-def _analyze_single(text: str, model_choice: str, maps: dict, threshold: float) -> dict:
-    """Jalankan ACD lalu ASC lewat HF Inference API (tanpa model lokal).
-
-    Catatan penting: supaya ACD berperilaku multi-label (sigmoid per label,
-    bukan softmax satu pemenang), config.json repo ACD di HuggingFace harus
-    berisi `"problem_type": "multi_label_classification"` -- ini yang
-    membuat pipeline text-classification bawaan HF Inference API otomatis
-    memakai sigmoid, persis seperti training-nya.
-    """
-    repos = HF_MODEL_REPOS[model_choice]
+def _analyze_single(text: str, tok_acd, mod_acd, tok_asc, mod_asc, maps: dict, threshold: float) -> dict:
     aspect_labels = maps["aspect_labels"]
     sentiment_labels = maps["sentiment_labels"]
+    id2sent = {i: lbl for i, lbl in enumerate(sentiment_labels)}
 
-    acd_scores = _hf_infer(repos["ACD"], text)
-    acd_by_label = _label_lookup(acd_scores, aspect_labels)
+    inputs_acd = tok_acd(text, return_tensors="pt", truncation=True, max_length=128).to(DEVICE)
+    with torch.no_grad():
+        logits_acd = mod_acd(**inputs_acd).logits
+        probs_acd = torch.sigmoid(logits_acd).squeeze(0).cpu().tolist()
 
-    detected = [code for code in aspect_labels if acd_by_label.get(code, 0.0) >= threshold]
+    if isinstance(probs_acd, float):
+        probs_acd = [probs_acd]
 
-    per_aspect_sentiment: Dict[str, str] = {}
+    detected = [aspect_labels[i] for i, p in enumerate(probs_acd) if p >= threshold and i < len(aspect_labels)]
+
+    per_aspect_sentiment = {}
     for aspect in detected:
         asc_input = f"{aspect} {text}"
-        asc_scores = _hf_infer(repos["ASC"], asc_input)
-        asc_by_label = _label_lookup(asc_scores, sentiment_labels)
-        if asc_by_label:
-            best_label = max(asc_by_label, key=asc_by_label.get)
-        else:
-            best_label = "Netral"
-        per_aspect_sentiment[aspect] = best_label if best_label in sentiment_labels else "Netral"
+        inputs_asc = tok_asc(asc_input, return_tensors="pt", truncation=True, max_length=128).to(DEVICE)
+        with torch.no_grad():
+            logits_asc = mod_asc(**inputs_asc).logits
+            pred_idx = int(torch.argmax(logits_asc, dim=1).item())
+        per_aspect_sentiment[aspect] = id2sent.get(pred_idx, "Netral")
 
     return per_aspect_sentiment
 
@@ -258,7 +265,8 @@ def analyze_texts_local(
 
     source_preview = source_label or texts[0]
 
-    progress(f"Menghubungi model {model_choice} di HuggingFace")
+    progress(f"Menyiapkan model {model_choice}")
+    tok_acd, mod_acd, tok_asc, mod_asc = get_models(model_choice, progress)
     maps = load_label_maps()
 
     aspects_result: dict[str, dict] = {}
@@ -266,7 +274,7 @@ def analyze_texts_local(
 
     progress("Model sedang mendeteksi aspek yang dibahas dalam ulasan")
     for text in texts:
-        per_aspect_sentiment = _analyze_single(text, model_choice, maps, threshold)
+        per_aspect_sentiment = _analyze_single(text, tok_acd, mod_acd, tok_asc, mod_asc, maps, threshold)
 
         for aspect, sent_label in per_aspect_sentiment.items():
             bucket = aspects_result.setdefault(

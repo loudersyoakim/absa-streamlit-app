@@ -11,8 +11,12 @@ plotly>=5.0.0
 matplotlib>=3.6.0
 
 # ML & NLP
-# Model BERT dijalankan di HuggingFace Inference API, bukan lokal --
-# jadi torch & transformers TIDAK dibutuhkan lagi di server Streamlit.
+# Model di-download dari HuggingFace lalu dijalankan LOKAL di proses
+# Streamlit ini (bukan lewat Inference API/Space eksternal). Cuma satu
+# model (IndoBERT atau mBERT) yang dimuat ke RAM dalam satu waktu -- lihat
+# get_models() di inference.py untuk mekanisme unload saat ganti model.
+torch>=2.0.0
+transformers>=4.30.0
 huggingface_hub>=0.24.0
 
 # File Handling
