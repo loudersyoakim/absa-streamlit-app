@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import json
-import re
 import time
 from datetime import datetime
 from typing import Callable, Optional, Dict, List, Any, Union
@@ -14,13 +13,11 @@ from bs4 import BeautifulSoup
 import streamlit as st
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from seleniumbase import Driver
 
 from utils import ASPECTS
 
-# HuggingFace di sini cuma dipakai sebagai penyimpanan bobot model (dan
-# file label_maps.json / acd_optimal_thresholds.json) -- model tetap
-# di-download lalu dijalankan LOKAL di proses Streamlit ini, bukan lewat
-# Inference API/Space eksternal.
+# HuggingFace Repo Configuration
 HF_MODEL_REPOS = {
     "IndoBERT": {
         "ACD": "loudersyoakim/absa-indobert-acd",
@@ -31,20 +28,13 @@ HF_MODEL_REPOS = {
         "ASC": "loudersyoakim/absa-mbert-asc",
     },
 }
-# Isi HF_TOKEN di Settings -> Secrets Streamlit Cloud kalau repo model private.
-HF_TOKEN = st.secrets.get("HF_TOKEN", None) if hasattr(st, "secrets") else None
 
-MODEL_KEY_ALIASES = {"IndoBERT": "indobert", "mBERT": "mbert"}
+HF_TOKEN = st.secrets.get("HF_TOKEN", None) if hasattr(st, "secrets") else None
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ProgressFn = Optional[Callable[[str], None]]
 DEFAULT_THRESHOLD = 0.5
-
 MODEL_KEY_ALIASES = {"IndoBERT": "indobert", "mBERT": "mbert"}
-ProgressFn = Optional[Callable[[str], None]]
-DEFAULT_THRESHOLD = 0.5
 
-# Nilai cadangan kalau label_maps.json / acd_optimal_thresholds.json belum
-# diupload ke repo HuggingFace (lihat Sub-bab 4.4.3 & 4.4.4 skripsi).
 FALLBACK_LABEL_MAPS = {
     "aspect_labels": ["A1", "A2", "A3", "B1", "B2", "B3", "C1", "C2", "D1"],
     "sentiment_labels": ["Negatif", "Netral", "Positif"],
@@ -55,32 +45,24 @@ FALLBACK_ACD_THRESHOLDS = {
 }
 
 REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
 }
-
 
 class InvalidTokopediaURLError(Exception):
     pass
 
-
 class ReviewsNotFoundError(Exception):
     pass
 
-
 class ModelLoadError(Exception):
-    """Dilempar kalau model gagal di-download/di-load dari HuggingFace
-    (repo tidak ditemukan, token salah untuk repo private, dsb.)."""
     pass
 
-
-# ScraperUnavailableError didefinisikan di dekat _build_driver() di bawah
-
+class ScraperUnavailableError(Exception):
+    pass
 
 def _noop(_msg: str) -> None:
-    return None
-
+    pass
 
 @st.cache_resource(show_spinner=False)
 def load_label_maps() -> dict:
@@ -95,24 +77,9 @@ def load_label_maps() -> dict:
     except Exception:
         return FALLBACK_LABEL_MAPS
 
-
 import gc
 import threading
 
-# --------------------------------------------------------------------------
-# Manajemen model: cuma SATU model (IndoBERT atau mBERT) yang boleh ada di
-# RAM dalam satu waktu. Ini penting karena tiap model (ACD+ASC) beratnya
-# ratusan MB -- kalau dua-duanya dibiarkan nyangkut di memori sekaligus,
-# server gratisan (RAM terbatas) bisa crash/restart.
-#
-# @st.cache_resource TIDAK dipakai di sini secara langsung untuk model,
-# karena cache itu menyimpan SETIAP kombinasi argumen yang pernah dipanggil
-# (jadi kalau user gonta-ganti IndoBERT <-> mBERT, keduanya tetap nyangkut
-# di cache dan tidak pernah di-unload). Sebagai gantinya, kita simpan
-# manual satu slot model aktif ("_ACTIVE"), dan setiap kali model yang
-# diminta beda dari yang sedang aktif, model lama di-hapus dulu dari
-# memori (del + gc.collect()) sebelum model baru di-download/di-load.
-# --------------------------------------------------------------------------
 _MODEL_LOCK = threading.Lock()
 _ACTIVE: Dict[str, Any] = {
     "model_choice": None,
@@ -120,9 +87,7 @@ _ACTIVE: Dict[str, Any] = {
     "tok_asc": None, "mod_asc": None,
 }
 
-
 def _unload_active_model() -> None:
-    """Hapus model yang sedang aktif dari memori (kalau ada)."""
     if _ACTIVE["model_choice"] is None:
         return
     _ACTIVE["tok_acd"] = None
@@ -134,9 +99,7 @@ def _unload_active_model() -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-
-def _download_model(model_choice: str, progress: "ProgressFn" = None):
-    """Download & load satu model (ACD+ASC) dari HuggingFace ke memori lokal."""
+def _download_model(model_choice: str, progress: ProgressFn = None):
     progress = progress or _noop
     repos = HF_MODEL_REPOS[model_choice]
 
@@ -151,26 +114,18 @@ def _download_model(model_choice: str, progress: "ProgressFn" = None):
         model_asc = AutoModelForSequenceClassification.from_pretrained(repos["ASC"], token=HF_TOKEN).to(DEVICE)
         model_asc.eval()
     except Exception as e:
-        raise ModelLoadError(
-            f"Gagal memuat model {model_choice} dari HuggingFace ({repos}): {e}"
-        ) from e
+        raise ModelLoadError(f"Gagal memuat model {model_choice} dari HuggingFace: {e}") from e
 
     return tokenizer_acd, model_acd, tokenizer_asc, model_asc
 
-
-def get_models(model_choice: str, progress: "ProgressFn" = None):
-    """Pastikan model `model_choice` aktif di memori. Kalau model lain
-    sedang aktif (user baru saja ganti pilihan di sidebar), model lama
-    di-unload dulu sebelum model baru dimuat -- jadi RAM cuma menampung
-    satu model sekaligus.
-    """
+def get_models(model_choice: str, progress: ProgressFn = None):
     progress = progress or _noop
     with _MODEL_LOCK:
         if _ACTIVE["model_choice"] == model_choice:
             return _ACTIVE["tok_acd"], _ACTIVE["mod_acd"], _ACTIVE["tok_asc"], _ACTIVE["mod_asc"]
 
         if _ACTIVE["model_choice"] is not None:
-            progress(f"Melepas model {_ACTIVE['model_choice']} dari memori sebelum ganti ke {model_choice}")
+            progress(f"Melepas model {_ACTIVE['model_choice']} dari memori.")
             _unload_active_model()
 
         tok_acd, mod_acd, tok_asc, mod_asc = _download_model(model_choice, progress)
@@ -182,7 +137,6 @@ def get_models(model_choice: str, progress: "ProgressFn" = None):
         _ACTIVE["mod_asc"] = mod_asc
 
         return tok_acd, mod_acd, tok_asc, mod_asc
-
 
 @st.cache_resource(show_spinner=False)
 def load_acd_threshold(model_choice: str) -> float:
@@ -199,7 +153,6 @@ def load_acd_threshold(model_choice: str) -> float:
     except Exception:
         return FALLBACK_ACD_THRESHOLDS.get(key, {}).get("threshold", DEFAULT_THRESHOLD)
 
-
 def get_model_info(model_type: str) -> Dict[str, Any]:
     maps = load_label_maps()
     return {
@@ -208,7 +161,6 @@ def get_model_info(model_type: str) -> Dict[str, Any]:
         "asc_model": "Aspect-based Sentiment Classification",
         "aspects": [ASPECTS.get(code, code) for code in maps.get("aspect_labels", [])],
     }
-
 
 def _empty_result_shell(model_choice: str, source_preview: str) -> dict:
     return {
@@ -221,7 +173,6 @@ def _empty_result_shell(model_choice: str, source_preview: str) -> dict:
         "most_negative_aspect": "Tidak ada",
         "n_reviews_processed": 0,
     }
-
 
 def _analyze_single(text: str, tok_acd, mod_acd, tok_asc, mod_asc, maps: dict, threshold: float) -> dict:
     aspect_labels = maps["aspect_labels"]
@@ -249,14 +200,7 @@ def _analyze_single(text: str, tok_acd, mod_acd, tok_asc, mod_asc, maps: dict, t
 
     return per_aspect_sentiment
 
-
-def analyze_texts_local(
-    texts: list[str],
-    model_choice: str,
-    threshold: float,
-    progress: ProgressFn = None,
-    source_label: str = "",
-) -> dict:
+def analyze_texts_local(texts: list[str], model_choice: str, threshold: float, progress: ProgressFn = None, source_label: str = "") -> dict:
     progress = progress or _noop
     texts = [t.strip() for t in texts if t and t.strip()]
 
@@ -264,7 +208,6 @@ def analyze_texts_local(
         return _empty_result_shell(model_choice, source_label)
 
     source_preview = source_label or texts[0]
-
     progress(f"Menyiapkan model {model_choice}")
     tok_acd, mod_acd, tok_asc, mod_asc = get_models(model_choice, progress)
     maps = load_label_maps()
@@ -306,8 +249,6 @@ def analyze_texts_local(
     else:
         most_positive = most_negative = "Tidak ada"
 
-    progress("Menyusun hasil analisis")
-
     return {
         "timestamp": datetime.now().strftime("%d %b %Y, %H:%M"),
         "model": model_choice,
@@ -319,14 +260,11 @@ def analyze_texts_local(
         "n_reviews_processed": len(texts),
     }
 
-
 def analyze_text_local(text: str, model_choice: str, threshold: float, progress: ProgressFn = None) -> dict:
     return analyze_texts_local([text], model_choice, threshold, progress=progress, source_label=text)
 
-
 def parse_text_input(text: str) -> List[str]:
     return [text.strip()]
-
 
 def parse_file_input(files: List) -> List[str]:
     reviews: List[str] = []
@@ -351,7 +289,6 @@ def parse_file_input(files: List) -> List[str]:
             continue
     return reviews
 
-
 def _is_valid_tokopedia_product_url(url: str) -> bool:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -361,42 +298,16 @@ def _is_valid_tokopedia_product_url(url: str) -> bool:
     path_parts = [p for p in unquote(parsed.path).split("/") if p]
     return len(path_parts) >= 2
 
-
-class ScraperUnavailableError(Exception):
-    pass
-
-
 def _build_driver():
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service
-
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1366,1000")
-    options.add_argument(f"user-agent={REQUEST_HEADERS['User-Agent']}")
-
-    chromium_bin = os.environ.get("CHROMIUM_BIN", "/usr/bin/chromium")
-    chromedriver_bin = os.environ.get("CHROMEDRIVER_BIN", "/usr/bin/chromedriver")
-
-    if os.path.exists(chromium_bin):
-        options.binary_location = chromium_bin
-
     try:
-        if os.path.exists(chromedriver_bin):
-            service = Service(executable_path=chromedriver_bin)
-        else:
-            from webdriver_manager.chrome import ChromeDriverManager
-            service = Service(ChromeDriverManager().install())
-        return webdriver.Chrome(service=service, options=options)
+        # SeleniumBase otomatis mengelola browser di background (headless)
+        driver = Driver(browser="chrome", headless=True)
+        return driver
     except Exception as e:
         raise ScraperUnavailableError(
-            f"Browser scraping tidak tersedia di server ini ({e}). "
-            f"Pastikan chromium & chromium-driver terpasang (lihat packages.txt)."
-        ) from e
-
+            f"Browser scraping tidak tersedia di server ini ({str(e)}). "
+            "Pastikan konfigurasi requirements.txt menggunakan seleniumbase."
+        )
 
 def _extract_reviews_from_page_source(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
@@ -412,7 +323,6 @@ def _extract_reviews_from_page_source(html: str) -> List[str]:
             if len(text) >= 5:
                 reviews.append(text)
     return reviews
-
 
 def scrape_tokopedia_reviews(url: str) -> tuple[List[str], str]:
     from selenium.webdriver.common.by import By
@@ -477,7 +387,6 @@ def scrape_tokopedia_reviews(url: str) -> tuple[List[str], str]:
             raise ReviewsNotFoundError("Mohon maaf, ulasan tidak berhasil didapatkan.")
 
         time.sleep(3)
-
         page_count = 1
         seen_reviews = set()
         max_pages = 20
@@ -500,7 +409,6 @@ def scrape_tokopedia_reviews(url: str) -> tuple[List[str], str]:
                 pass
 
             page_reviews = _extract_reviews_from_page_source(driver.page_source)
-
             new_found = 0
             for review in page_reviews:
                 if review not in seen_reviews:
@@ -531,7 +439,6 @@ def scrape_tokopedia_reviews(url: str) -> tuple[List[str], str]:
 
             if not next_clicked:
                 break
-
             page_count += 1
 
     finally:
@@ -542,10 +449,8 @@ def scrape_tokopedia_reviews(url: str) -> tuple[List[str], str]:
 
     return all_reviews, product_title
 
-
 def preprocess_text(text: str) -> str:
     return text.strip()
-
 
 def _aspect_summary(aspect_code: str, bucket: dict) -> Dict[str, Any]:
     counts = bucket["counts"]
@@ -558,7 +463,6 @@ def _aspect_summary(aspect_code: str, bucket: dict) -> Dict[str, Any]:
         "total": total,
     }
 
-
 def _calculate_top_discussed(aspects_result: Dict[str, dict]) -> Dict[str, Any]:
     if not aspects_result:
         return {"aspect": "Tidak ada data", "percentage": 0, "positive": 0, "neutral": 0, "negative": 0, "total": 0}
@@ -568,7 +472,6 @@ def _calculate_top_discussed(aspects_result: Dict[str, dict]) -> Dict[str, Any]:
     summary = _aspect_summary(top_code, aspects_result[top_code])
     summary["percentage"] = (summary["total"] / grand_total) * 100
     return summary
-
 
 def _calculate_top_complained(aspects_result: Dict[str, dict]) -> Dict[str, Any]:
     eligible = {a: b for a, b in aspects_result.items() if b["counts"]["Negatif"] > 0}
@@ -584,7 +487,6 @@ def _calculate_top_complained(aspects_result: Dict[str, dict]) -> Dict[str, Any]
     summary["percentage"] = _ratio(top_code) * 100
     return summary
 
-
 def _calculate_overall_sentiment(totals: Dict[str, int]) -> Dict[str, int]:
     return {
         "Positif": totals.get("Positif", 0),
@@ -592,10 +494,8 @@ def _calculate_overall_sentiment(totals: Dict[str, int]) -> Dict[str, int]:
         "Negatif": totals.get("Negatif", 0),
     }
 
-
 def _calculate_aspect_distribution(aspects_result: Dict[str, dict]) -> Dict[str, int]:
     return {bucket.get("name", code): bucket["total"] for code, bucket in aspects_result.items()}
-
 
 def _structure_detailed_results(aspects_result: Dict[str, dict]) -> List[Dict[str, Any]]:
     detailed = []
@@ -611,7 +511,6 @@ def _structure_detailed_results(aspects_result: Dict[str, dict]) -> List[Dict[st
         })
     return detailed
 
-
 def _first_n_words(text: str, n: int = 5) -> str:
     words = text.strip().split()
     if not words:
@@ -619,14 +518,7 @@ def _first_n_words(text: str, n: int = 5) -> str:
     snippet = " ".join(words[:n])
     return snippet + ("..." if len(words) > n else "")
 
-
-def run_inference(
-    input_data: Union[str, List],
-    model_type: str = "IndoBERT",
-    mode: str = "Teks",
-    threshold: Optional[float] = None,
-    progress: ProgressFn = None,
-) -> Dict[str, Any]:
+def run_inference(input_data: Union[str, List], model_type: str = "IndoBERT", mode: str = "Teks", threshold: Optional[float] = None, progress: ProgressFn = None) -> Dict[str, Any]:
     progress = progress or _noop
 
     progress("Menyiapkan data ulasan")
