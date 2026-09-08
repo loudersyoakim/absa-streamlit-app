@@ -10,11 +10,6 @@ numpy>=1.23.0
 plotly>=5.0.0
 matplotlib>=3.6.0
 
-# ML & NLP
-# Model di-download dari HuggingFace lalu dijalankan LOKAL di proses
-# Streamlit ini (bukan lewat Inference API/Space eksternal). Cuma satu
-# model (IndoBERT atau mBERT) yang dimuat ke RAM dalam satu waktu -- lihat
-# get_models() di inference.py untuk mekanisme unload saat ganti model.
 torch>=2.0.0
 transformers>=4.30.0
 huggingface_hub>=0.24.0
@@ -33,7 +28,3 @@ webdriver-manager>=4.0.0
 python-dotenv>=1.0.0
 tqdm>=4.65.0  # Progress bars
 python-dateutil>=2.8.0
-
-# pytest>=7.4.0
-# black>=23.0.0
-# pylint>=2.17.0
