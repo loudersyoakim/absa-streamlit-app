@@ -13,8 +13,8 @@ from bs4 import BeautifulSoup
 import streamlit as st
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from seleniumbase import Driver
-
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
 from utils import ASPECTS
 
 # HuggingFace Repo Configuration
@@ -299,19 +299,24 @@ def _is_valid_tokopedia_product_url(url: str) -> bool:
     return len(path_parts) >= 2
 
 def _build_driver():
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    
+    # Kunci utama: Arahkan langsung ke browser bawaan Streamlit
+    options.binary_location = "/usr/bin/chromium"
+    service = Service("/usr/bin/chromedriver")
+    
     try:
-        driver = Driver(
-            browser="chrome", 
-            headless=True,
-            chromium_arg="--no-sandbox, --disable-dev-shm-usage, --disable-gpu"
-        )
+        driver = webdriver.Chrome(service=service, options=options)
         return driver
     except Exception as e:
         raise ScraperUnavailableError(
-            f"Browser scraping tidak tersedia di server ini ({str(e)}). "
-            "Pastikan konfigurasi requirements.txt menggunakan seleniumbase."
+            f"Gagal memuat browser bawaan Streamlit: {e}"
         )
-
+        
 def _extract_reviews_from_page_source(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
     review_section = soup.find("section", id="review-feed")
