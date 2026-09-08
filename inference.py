@@ -300,8 +300,11 @@ def _is_valid_tokopedia_product_url(url: str) -> bool:
 
 def _build_driver():
     try:
-        # SeleniumBase otomatis mengelola browser di background (headless)
-        driver = Driver(browser="chrome", headless=True)
+        driver = Driver(
+            browser="chrome", 
+            headless=True,
+            chromium_arg="--no-sandbox, --disable-dev-shm-usage, --disable-gpu"
+        )
         return driver
     except Exception as e:
         raise ScraperUnavailableError(
