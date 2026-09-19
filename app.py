@@ -586,7 +586,8 @@ elif st.session_state.input_mode == "URL Tokopedia":
 
 elif st.session_state.input_mode == "Upload File":
     with st.container(key="absa_alt_input_dock"):
-        with st.form(key="form_upload_absa", clear_on_submit=True, border=False):
+        # PERBAIKAN: Form dibuat agar menyimpan state file yang diunggah
+        with st.form(key="form_upload_absa", clear_on_submit=False, border=False):
             col_field, col_submit = st.columns([15, 1])
             with col_field:
                 file_terupload = st.file_uploader(
@@ -607,7 +608,8 @@ elif st.session_state.input_mode == "Upload File":
 # ======================================================================
 # 8. PEMROSESAN PESAN DAN PEMANGGILAN INFERENCE
 # ======================================================================
-if pesan_user:
+# PERBAIKAN: Proses inferensi dibungkus agar tidak memicu infinite loop reload
+if pesan_user and st.session_state.analysis_results is None:
     if st.session_state.input_mode == "Teks":
         data_untuk_inference = pesan_user
     elif st.session_state.input_mode == "URL Tokopedia":
@@ -615,11 +617,11 @@ if pesan_user:
     else:
         data_untuk_inference = file_terupload_list
 
-    with st.status("Menyiapkan data ulasan", expanded=True) as status:
+    with st.status("Menyiapkan data ulasan...", expanded=True) as status:
         def progress(msg: str) -> None:
             status.update(label=msg)
             st.write(msg)
-            time.sleep(1)
+            time.sleep(0.5)
 
         try:
             hasil = run_inference(
@@ -628,8 +630,10 @@ if pesan_user:
                 mode=st.session_state.input_mode,
                 progress=progress,
             )
-            status.update(label="Analisis selesai, berikut hasilnya", state="complete")
+            # Simpan hasil langsung ke session_state agar permanen saat rerunt
             st.session_state.analysis_results = hasil
+            status.update(label="Analisis selesai, berikut hasilnya", state="complete")
+            st.rerun() # Pemicu penyegaran aman setelah data state dipastikan terisi
 
         except InvalidTokopediaURLError:
             status.update(label="URL tidak valid", state="error")
@@ -653,8 +657,6 @@ if pesan_user:
             status.update(label="Analisis gagal", state="error")
             st.error(f"Terjadi kesalahan saat memproses ulasan: {e}")
 
-    if st.session_state.analysis_results is not None:
-        st.rerun()
 
 # ======================================================================
 # 9. FOOTER
