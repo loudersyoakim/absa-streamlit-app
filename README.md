@@ -12,10 +12,8 @@ Prototipe web *proof of concept* dari skripsi **“Implementasi Aspect-Based Sen
 
 [Fitur](#-fitur) · [Cara Kerja End-to-End](#-cara-kerja-end-to-end) · [Instalasi](#️-instalasi-dan-menjalankan) · [Deploy](#-deploy-ke-streamlit-community-cloud) · [Catatan Teknis](#-catatan-teknis-dan-keterbatasan)
 
-<!-- Tambahkan tautan demo di sini bila aplikasi sudah dideploy -->
-
-<img src="docs/screenshot-beranda.png" alt="Halaman beranda aplikasi ABSA" width="48%"> <img src="docs/screenshot-dasbor.png" alt="Dasbor hasil analisis ABSA" width="48%">
-
+[<!-- Tambahkan tautan demo di sini bila aplikasi sudah dideploy -->
+](https://absa-app-finish-louders.streamlit.app/)
 </div>
 
 ---
