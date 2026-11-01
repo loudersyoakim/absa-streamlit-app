@@ -287,16 +287,6 @@ Karena berjalan di CPU, siapkan memori yang cukup; aplikasi hanya menahan **satu
 
 ## ⚠️ Catatan Teknis dan Keterbatasan
 
-### Konsistensi dengan lingkungan pelatihan
-
-Model dilatih pada skema berikut, dan beberapa bagian aplikasi saat ini **belum sepenuhnya menyamainya**. Perbaiki sebelum mengandalkan hasil kuantitatif aplikasi, lalu hapus bagian ini.
-
-| Aspek | Saat pelatihan (repo penelitian) | Aplikasi saat ini |
-|---|---|---|
-| Input ASC | **Pasangan kalimat** `tokenizer(ulasan, kode_aspek)` → `[CLS] ulasan [SEP] kode_aspek [SEP]` | Satu string `f"{aspek} {teks}"` pada `_analyze_single` |
-| Prapemrosesan | *Case folding*, pembersihan simbol, normalisasi jargon teknis dan kata baku | Hanya `strip()` (`preprocess_text`) |
-| Impor Selenium | — | `_build_driver` memakai `webdriver.Chrome` sehingga memerlukan `from selenium import webdriver` |
-
 ### Keterbatasan umum
 
 - **Prototipe *proof of concept*:** belum diuji pengguna maupun uji beban; bukan produk siap produksi.
