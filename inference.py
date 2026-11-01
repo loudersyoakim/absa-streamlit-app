@@ -1,22 +1,31 @@
 from __future__ import annotations
 
 import os
+import re
+import gc
 import json
 import time
+import threading
 from datetime import datetime
-from typing import Callable, Optional, Dict, List, Any, Union
+from pathlib import Path
+from typing import Callable, Optional, Dict, List, Any, Union, Tuple
 from urllib.parse import urlparse, unquote
 
+import pandas as pd
 import torch
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from utils import ASPECTS
 
+# ======================================================================
+# KONFIGURASI
+# ======================================================================
 # HuggingFace Repo Configuration
 HF_MODEL_REPOS = {
     "IndoBERT": {
@@ -34,6 +43,13 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ProgressFn = Optional[Callable[[str], None]]
 DEFAULT_THRESHOLD = 0.5
 MODEL_KEY_ALIASES = {"IndoBERT": "indobert", "mBERT": "mbert"}
+MAX_LENGTH = 128
+
+# Folder kamus normalisasi (identik dengan src/ pada repo penelitian)
+RESOURCE_DIR = Path(__file__).resolve().parent / "resources"
+KAMUS_BAKU_XLSX = RESOURCE_DIR / "kamuskatabaku.xlsx"
+KAMUS_BAKU_CSV = RESOURCE_DIR / "kamus_kata_baku2.csv"
+KAMUS_TEKNIS_CSV = RESOURCE_DIR / "kamus_teknis.csv"
 
 FALLBACK_LABEL_MAPS = {
     "aspect_labels": ["A1", "A2", "A3", "B1", "B2", "B3", "C1", "C2", "D1"],
@@ -49,21 +65,30 @@ REQUEST_HEADERS = {
     "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
+
 class InvalidTokopediaURLError(Exception):
     pass
+
 
 class ReviewsNotFoundError(Exception):
     pass
 
+
 class ModelLoadError(Exception):
     pass
+
 
 class ScraperUnavailableError(Exception):
     pass
 
+
 def _noop(_msg: str) -> None:
     pass
 
+
+# ======================================================================
+# LABEL MAP DAN THRESHOLD (dari Hugging Face, dengan cadangan lokal)
+# ======================================================================
 @st.cache_resource(show_spinner=False)
 def load_label_maps() -> dict:
     try:
@@ -77,15 +102,33 @@ def load_label_maps() -> dict:
     except Exception:
         return FALLBACK_LABEL_MAPS
 
-import gc
-import threading
 
+@st.cache_resource(show_spinner=False)
+def load_acd_threshold(model_choice: str) -> float:
+    key = MODEL_KEY_ALIASES.get(model_choice, model_choice.lower())
+    try:
+        path = hf_hub_download(
+            repo_id=HF_MODEL_REPOS[model_choice]["ACD"],
+            filename="acd_optimal_thresholds.json",
+            token=HF_TOKEN,
+        )
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return float(data[key]["threshold"])
+    except Exception:
+        return FALLBACK_ACD_THRESHOLDS.get(key, {}).get("threshold", DEFAULT_THRESHOLD)
+
+
+# ======================================================================
+# MANAJEMEN MODEL (satu model aktif di memori)
+# ======================================================================
 _MODEL_LOCK = threading.Lock()
 _ACTIVE: Dict[str, Any] = {
     "model_choice": None,
     "tok_acd": None, "mod_acd": None,
     "tok_asc": None, "mod_asc": None,
 }
+
 
 def _unload_active_model() -> None:
     if _ACTIVE["model_choice"] is None:
@@ -98,6 +141,7 @@ def _unload_active_model() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
 
 def _download_model(model_choice: str, progress: ProgressFn = None):
     progress = progress or _noop
@@ -117,6 +161,7 @@ def _download_model(model_choice: str, progress: ProgressFn = None):
         raise ModelLoadError(f"Gagal memuat model {model_choice} dari HuggingFace: {e}") from e
 
     return tokenizer_acd, model_acd, tokenizer_asc, model_asc
+
 
 def get_models(model_choice: str, progress: ProgressFn = None):
     progress = progress or _noop
@@ -138,20 +183,6 @@ def get_models(model_choice: str, progress: ProgressFn = None):
 
         return tok_acd, mod_acd, tok_asc, mod_asc
 
-@st.cache_resource(show_spinner=False)
-def load_acd_threshold(model_choice: str) -> float:
-    key = MODEL_KEY_ALIASES.get(model_choice, model_choice.lower())
-    try:
-        path = hf_hub_download(
-            repo_id=HF_MODEL_REPOS[model_choice]["ACD"],
-            filename="acd_optimal_thresholds.json",
-            token=HF_TOKEN,
-        )
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return float(data[key]["threshold"])
-    except Exception:
-        return FALLBACK_ACD_THRESHOLDS.get(key, {}).get("threshold", DEFAULT_THRESHOLD)
 
 def get_model_info(model_type: str) -> Dict[str, Any]:
     maps = load_label_maps()
@@ -162,6 +193,95 @@ def get_model_info(model_type: str) -> Dict[str, Any]:
         "aspects": [ASPECTS.get(code, code) for code in maps.get("aspect_labels", [])],
     }
 
+
+# ======================================================================
+# PRAPEMROSESAN (identik dengan notebooks/01_preprocessing.ipynb)
+# ======================================================================
+@st.cache_resource(show_spinner=False)
+def _load_normalization_resources() -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Memuat kamus normalisasi dari folder resources/.
+
+    Mengembalikan (dict_kata_baku, dict_teknis). Bila sebuah berkas tidak
+    ditemukan, kamus tersebut dilewati agar aplikasi tetap berjalan (tetap
+    melakukan case folding dan pembersihan simbol).
+    """
+    dict_baku_xlsx: Dict[str, str] = {}
+    dict_baku_csv: Dict[str, str] = {}
+    dict_teknis: Dict[str, str] = {}
+
+    try:
+        df = pd.read_excel(KAMUS_BAKU_XLSX)
+        dict_baku_xlsx = dict(zip(
+            df["tidak_baku"].astype(str).str.lower(),
+            df["kata_baku"].astype(str).str.lower(),
+        ))
+    except Exception as e:
+        print(f"[preprocess] Gagal memuat {KAMUS_BAKU_XLSX.name}: {e}")
+
+    try:
+        df = pd.read_csv(KAMUS_BAKU_CSV, sep=";")
+        dict_baku_csv = dict(zip(
+            df["Kata_Asal"].astype(str).str.lower(),
+            df["Kata_Baku"].astype(str).str.lower(),
+        ))
+    except Exception as e:
+        print(f"[preprocess] Gagal memuat {KAMUS_BAKU_CSV.name}: {e}")
+
+    try:
+        df = pd.read_csv(KAMUS_TEKNIS_CSV, sep=";")
+        dict_teknis = dict(zip(
+            df["Variasi_Penulisan"].astype(str).str.lower(),
+            df["Penulisan_Standar"].astype(str),
+        ))
+    except Exception as e:
+        print(f"[preprocess] Gagal memuat {KAMUS_TEKNIS_CSV.name}: {e}")
+
+    # Kamus typo manual menimpa kamus eksternal bila ada kunci yang sama
+    dict_baku = {**dict_baku_xlsx, **dict_baku_csv}
+    return dict_baku, dict_teknis
+
+
+@st.cache_resource(show_spinner=False)
+def _compiled_technical_patterns() -> List[Tuple[re.Pattern, str]]:
+    _, dict_teknis = _load_normalization_resources()
+    return [
+        (re.compile(r"\b" + re.escape(variasi) + r"\b"), standar)
+        for variasi, standar in dict_teknis.items()
+    ]
+
+
+def preprocess_text(text: str) -> str:
+    """Prapemrosesan yang sama dengan saat pelatihan (notebook 01).
+
+    1. Case folding
+    2. Pembersihan: karakter non-alfanumerik -> spasi, rapikan spasi
+    3. Normalisasi jargon teknis (mis. '144 hz' -> '144Hz')
+    4. Normalisasi kata baku dan typo per kata
+    """
+    if text is None or (isinstance(text, float) and pd.isna(text)):
+        return ""
+
+    dict_baku, _ = _load_normalization_resources()
+
+    # 1. Case folding
+    text = str(text).lower()
+
+    # 2. Pembersihan data
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # 3. Normalisasi bahasa teknis
+    for pattern, standar in _compiled_technical_patterns():
+        text = pattern.sub(standar, text)
+
+    # 4. Normalisasi typo dan kata baku
+    words = [dict_baku.get(w.lower(), w) for w in text.split()]
+    return " ".join(words)
+
+
+# ======================================================================
+# INFERENSI ABSA
+# ======================================================================
 def _empty_result_shell(model_choice: str, source_preview: str) -> dict:
     return {
         "timestamp": datetime.now().strftime("%d %b %Y, %H:%M"),
@@ -174,12 +294,19 @@ def _empty_result_shell(model_choice: str, source_preview: str) -> dict:
         "n_reviews_processed": 0,
     }
 
+
 def _analyze_single(text: str, tok_acd, mod_acd, tok_asc, mod_asc, maps: dict, threshold: float) -> dict:
+    """Menganalisis satu ulasan (sudah diprapemroses).
+
+    ACD : [CLS] ulasan [SEP]                  -> sigmoid per aspek
+    ASC : [CLS] ulasan [SEP] kode_aspek [SEP] -> softmax 3 kelas
+          (pasangan kalimat, sama dengan format pelatihan)
+    """
     aspect_labels = maps["aspect_labels"]
     sentiment_labels = maps["sentiment_labels"]
     id2sent = {i: lbl for i, lbl in enumerate(sentiment_labels)}
 
-    inputs_acd = tok_acd(text, return_tensors="pt", truncation=True, max_length=128).to(DEVICE)
+    inputs_acd = tok_acd(text, return_tensors="pt", truncation=True, max_length=MAX_LENGTH).to(DEVICE)
     with torch.no_grad():
         logits_acd = mod_acd(**inputs_acd).logits
         probs_acd = torch.sigmoid(logits_acd).squeeze(0).cpu().tolist()
@@ -191,8 +318,8 @@ def _analyze_single(text: str, tok_acd, mod_acd, tok_asc, mod_asc, maps: dict, t
 
     per_aspect_sentiment = {}
     for aspect in detected:
-        asc_input = f"{aspect} {text}"
-        inputs_asc = tok_asc(asc_input, return_tensors="pt", truncation=True, max_length=128).to(DEVICE)
+        # Pasangan kalimat (ulasan, kode aspek), identik dengan ASCDataset pada pelatihan
+        inputs_asc = tok_asc(text, aspect, return_tensors="pt", truncation=True, max_length=MAX_LENGTH).to(DEVICE)
         with torch.no_grad():
             logits_asc = mod_asc(**inputs_asc).logits
             pred_idx = int(torch.argmax(logits_asc, dim=1).item())
@@ -200,14 +327,36 @@ def _analyze_single(text: str, tok_acd, mod_acd, tok_asc, mod_asc, maps: dict, t
 
     return per_aspect_sentiment
 
-def analyze_texts_local(texts: list[str], model_choice: str, threshold: float, progress: ProgressFn = None, source_label: str = "") -> dict:
-    progress = progress or _noop
-    texts = [t.strip() for t in texts if t and t.strip()]
 
-    if not texts:
+def analyze_texts_local(
+    texts: list[str],
+    model_choice: str,
+    threshold: float,
+    progress: ProgressFn = None,
+    source_label: str = "",
+    display_texts: Optional[list[str]] = None,
+) -> dict:
+    """Menganalisis daftar ulasan.
+
+    texts         : teks yang diprapemroses (masuk ke model)
+    display_texts : teks asli pengguna (ditampilkan di dasbor); bila None,
+                    dipakai texts.
+    """
+    progress = progress or _noop
+
+    if display_texts is None or len(display_texts) != len(texts):
+        display_texts = texts
+
+    pairs = [
+        (t.strip(), d.strip())
+        for t, d in zip(texts, display_texts)
+        if t and t.strip()
+    ]
+
+    if not pairs:
         return _empty_result_shell(model_choice, source_label)
 
-    source_preview = source_label or texts[0]
+    source_preview = source_label or pairs[0][1]
     progress(f"Menyiapkan model {model_choice}")
     tok_acd, mod_acd, tok_asc, mod_asc = get_models(model_choice, progress)
     maps = load_label_maps()
@@ -216,8 +365,8 @@ def analyze_texts_local(texts: list[str], model_choice: str, threshold: float, p
     totals = {"Positif": 0, "Negatif": 0, "Netral": 0}
 
     progress("Model sedang mendeteksi aspek yang dibahas dalam ulasan")
-    for text in texts:
-        per_aspect_sentiment = _analyze_single(text, tok_acd, mod_acd, tok_asc, mod_asc, maps, threshold)
+    for model_text, shown_text in pairs:
+        per_aspect_sentiment = _analyze_single(model_text, tok_acd, mod_acd, tok_asc, mod_asc, maps, threshold)
 
         for aspect, sent_label in per_aspect_sentiment.items():
             bucket = aspects_result.setdefault(
@@ -232,7 +381,7 @@ def analyze_texts_local(texts: list[str], model_choice: str, threshold: float, p
             bucket["counts"][sent_label] += 1
             bucket["total"] += 1
             if len(bucket["reviews"][sent_label]) < 30:
-                bucket["reviews"][sent_label].append(text[:220])
+                bucket["reviews"][sent_label].append(shown_text[:220])
             totals[sent_label] += 1
 
     progress("Mengklasifikasikan sentimen untuk setiap aspek yang terdeteksi")
@@ -257,14 +406,23 @@ def analyze_texts_local(texts: list[str], model_choice: str, threshold: float, p
         "totals": totals,
         "most_positive_aspect": most_positive,
         "most_negative_aspect": most_negative,
-        "n_reviews_processed": len(texts),
+        "n_reviews_processed": len(pairs),
     }
 
-def analyze_text_local(text: str, model_choice: str, threshold: float, progress: ProgressFn = None) -> dict:
-    return analyze_texts_local([text], model_choice, threshold, progress=progress, source_label=text)
 
+def analyze_text_local(text: str, model_choice: str, threshold: float, progress: ProgressFn = None) -> dict:
+    return analyze_texts_local(
+        [preprocess_text(text)], model_choice, threshold,
+        progress=progress, source_label=text, display_texts=[text],
+    )
+
+
+# ======================================================================
+# PARSER INPUT
+# ======================================================================
 def parse_text_input(text: str) -> List[str]:
     return [text.strip()]
+
 
 def parse_file_input(files: List) -> List[str]:
     reviews: List[str] = []
@@ -272,7 +430,6 @@ def parse_file_input(files: List) -> List[str]:
         file_type = file.name.split(".")[-1].lower()
         try:
             if file_type == "csv":
-                import pandas as pd
                 df = pd.read_csv(file)
                 col = df.columns[0]
                 reviews.extend(df[col].astype(str).tolist())
@@ -280,7 +437,6 @@ def parse_file_input(files: List) -> List[str]:
                 content = file.read().decode("utf-8")
                 reviews.extend([line.strip() for line in content.split("\n") if line.strip()])
             elif file_type == "xlsx":
-                import pandas as pd
                 df = pd.read_excel(file)
                 col = df.columns[0]
                 reviews.extend(df[col].astype(str).tolist())
@@ -289,6 +445,10 @@ def parse_file_input(files: List) -> List[str]:
             continue
     return reviews
 
+
+# ======================================================================
+# SCRAPER TOKOPEDIA
+# ======================================================================
 def _is_valid_tokopedia_product_url(url: str) -> bool:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -298,17 +458,18 @@ def _is_valid_tokopedia_product_url(url: str) -> bool:
     path_parts = [p for p in unquote(parsed.path).split("/") if p]
     return len(path_parts) >= 2
 
+
 def _build_driver():
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    
-    # Kunci utama: Arahkan langsung ke browser bawaan Streamlit
+
+    # Arahkan langsung ke Chromium bawaan Streamlit Cloud (dipasang lewat packages.txt)
     options.binary_location = "/usr/bin/chromium"
     service = Service("/usr/bin/chromedriver")
-    
+
     try:
         driver = webdriver.Chrome(service=service, options=options)
         return driver
@@ -316,7 +477,8 @@ def _build_driver():
         raise ScraperUnavailableError(
             f"Gagal memuat browser bawaan Streamlit: {e}"
         )
-        
+
+
 def _extract_reviews_from_page_source(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
     review_section = soup.find("section", id="review-feed")
@@ -331,6 +493,7 @@ def _extract_reviews_from_page_source(html: str) -> List[str]:
             if len(text) >= 5:
                 reviews.append(text)
     return reviews
+
 
 def scrape_tokopedia_reviews(url: str) -> tuple[List[str], str]:
     from selenium.webdriver.common.by import By
@@ -457,9 +620,10 @@ def scrape_tokopedia_reviews(url: str) -> tuple[List[str], str]:
 
     return all_reviews, product_title
 
-def preprocess_text(text: str) -> str:
-    return text.strip()
 
+# ======================================================================
+# STATISTIK AKHIR
+# ======================================================================
 def _aspect_summary(aspect_code: str, bucket: dict) -> Dict[str, Any]:
     counts = bucket["counts"]
     total = bucket["total"] or 0
@@ -471,6 +635,7 @@ def _aspect_summary(aspect_code: str, bucket: dict) -> Dict[str, Any]:
         "total": total,
     }
 
+
 def _calculate_top_discussed(aspects_result: Dict[str, dict]) -> Dict[str, Any]:
     if not aspects_result:
         return {"aspect": "Tidak ada data", "percentage": 0, "positive": 0, "neutral": 0, "negative": 0, "total": 0}
@@ -480,6 +645,7 @@ def _calculate_top_discussed(aspects_result: Dict[str, dict]) -> Dict[str, Any]:
     summary = _aspect_summary(top_code, aspects_result[top_code])
     summary["percentage"] = (summary["total"] / grand_total) * 100
     return summary
+
 
 def _calculate_top_complained(aspects_result: Dict[str, dict]) -> Dict[str, Any]:
     eligible = {a: b for a, b in aspects_result.items() if b["counts"]["Negatif"] > 0}
@@ -495,6 +661,7 @@ def _calculate_top_complained(aspects_result: Dict[str, dict]) -> Dict[str, Any]
     summary["percentage"] = _ratio(top_code) * 100
     return summary
 
+
 def _calculate_overall_sentiment(totals: Dict[str, int]) -> Dict[str, int]:
     return {
         "Positif": totals.get("Positif", 0),
@@ -502,8 +669,10 @@ def _calculate_overall_sentiment(totals: Dict[str, int]) -> Dict[str, int]:
         "Negatif": totals.get("Negatif", 0),
     }
 
+
 def _calculate_aspect_distribution(aspects_result: Dict[str, dict]) -> Dict[str, int]:
     return {bucket.get("name", code): bucket["total"] for code, bucket in aspects_result.items()}
+
 
 def _structure_detailed_results(aspects_result: Dict[str, dict]) -> List[Dict[str, Any]]:
     detailed = []
@@ -519,6 +688,7 @@ def _structure_detailed_results(aspects_result: Dict[str, dict]) -> List[Dict[st
         })
     return detailed
 
+
 def _first_n_words(text: str, n: int = 5) -> str:
     words = text.strip().split()
     if not words:
@@ -526,7 +696,17 @@ def _first_n_words(text: str, n: int = 5) -> str:
     snippet = " ".join(words[:n])
     return snippet + ("..." if len(words) > n else "")
 
-def run_inference(input_data: Union[str, List], model_type: str = "IndoBERT", mode: str = "Teks", threshold: Optional[float] = None, progress: ProgressFn = None) -> Dict[str, Any]:
+
+# ======================================================================
+# TITIK MASUK
+# ======================================================================
+def run_inference(
+    input_data: Union[str, List],
+    model_type: str = "IndoBERT",
+    mode: str = "Teks",
+    threshold: Optional[float] = None,
+    progress: ProgressFn = None,
+) -> Dict[str, Any]:
     progress = progress or _noop
 
     progress("Menyiapkan data ulasan")
@@ -549,17 +729,30 @@ def run_inference(input_data: Union[str, List], model_type: str = "IndoBERT", mo
         raise ReviewsNotFoundError("Mohon maaf, ulasan tidak berhasil didapatkan.")
 
     progress("Membaca dan membersihkan teks ulasan")
-    reviews = [preprocess_text(r) for r in reviews if r and r.strip()]
+    originals: List[str] = []
+    cleaned: List[str] = []
+    for r in reviews:
+        if not r or not str(r).strip():
+            continue
+        c = preprocess_text(r)
+        if not c:  # ulasan yang kosong setelah pembersihan (mis. hanya emoji) dilewati
+            continue
+        originals.append(str(r).strip())
+        cleaned.append(c)
+
+    if not cleaned:
+        raise ReviewsNotFoundError("Mohon maaf, ulasan tidak berhasil didapatkan.")
 
     if threshold is None:
         threshold = load_acd_threshold(model_type)
 
     hasil = analyze_texts_local(
-        reviews,
+        cleaned,
         model_choice=model_type,
         threshold=threshold,
         progress=progress,
         source_label=source_label,
+        display_texts=originals,
     )
 
     progress("Menghitung statistik akhir")
