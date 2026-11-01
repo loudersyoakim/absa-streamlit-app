@@ -55,6 +55,7 @@ Rincian metodologi, uji statistik, dan keterbatasan ada di [repositori penelitia
 ## ✨ Fitur
 
 - **Tiga mode input:** teks tunggal, unggah berkas (CSV / XLSX / TXT, boleh banyak berkas), dan **URL produk Tokopedia** (ulasan diambil otomatis).
+- **Prapemrosesan identik dengan pelatihan:** case folding, pembersihan simbol, serta normalisasi jargon teknis (mis. `144 hz` → `144Hz`) dan kata baku/typo lewat tiga kamus di `resources/`.
 - **Pilihan model:** IndoBERT atau mBERT dari sidebar; hanya satu model dimuat ke memori pada satu waktu.
 - **Sembilan kategori aspek:** kinerja visual, keandalan & cacat, desain & fitur, komunikasi penjual, layanan purna jual, akurasi informasi, pengemasan & pengiriman, harga & nilai, umum.
 - **Dasbor interaktif (Plotly):** kartu aspek paling dibahas dan paling dikeluhkan, diagram pai distribusi aspek dan sentimen, *stacked bar* sentimen per aspek, serta daftar ulasan per aspek dan sentimen.
@@ -76,7 +77,7 @@ flowchart TD
     T --> R["Daftar ulasan"]
     F --> R
     S --> R
-    R --> P["Prapemrosesan<br/>(strip & buang ulasan kosong)"]
+    R --> P["Prapemrosesan<br/>case folding · pembersihan · normalisasi kamus"]
     P --> L["Muat model dari Hugging Face<br/>(ACD + ASC, cache satu model aktif)"]
     L --> A["ACD: Sigmoid per aspek ≥ threshold"]
     A --> C["ASC: sentimen untuk setiap aspek terdeteksi"]
@@ -102,6 +103,7 @@ sequenceDiagram
     else mode = Teks / Upload File
         INF->>INF: parse teks atau baca berkas
     end
+    INF->>INF: prapemrosesan (kamus di resources/)
     INF->>HF: unduh tokenizer + model ACD & ASC (sekali, lalu cache)
     HF-->>INF: bobot, label_maps.json, acd_optimal_thresholds.json
     loop setiap ulasan
@@ -142,9 +144,22 @@ Bila tidak ada ulasan yang didapat, aplikasi menampilkan: *“Mohon maaf, ulasan
 4. Pada setiap halaman ulasan: mengklik **“Selengkapnya”** agar teks panjang terbuka, mengurai HTML dengan BeautifulSoup (`section#review-feed` → elemen `lblItemUlasan`, minimal 5 karakter), membuang duplikat.
 5. Klik **“Laman berikutnya”**; berhenti bila tombol habis, setelah **2 halaman beruntun tanpa ulasan baru**, atau mencapai **maksimum 20 halaman**.
 
-#### 4. Prapemrosesan
+#### 4. Prapemrosesan (`preprocess_text`)
 
-Teks dibersihkan dari spasi di tepi (`strip`) dan ulasan kosong dibuang sebelum masuk model.
+Setiap ulasan diprapemroses **sama persis dengan saat pelatihan** (`01_preprocessing.ipynb` pada repositori penelitian), karena model dilatih pada teks yang sudah dinormalisasi:
+
+| Urutan | Langkah | Contoh |
+|:---:|---|---|
+| 1 | **Case folding**: seluruh teks menjadi huruf kecil | `Hallo Kaka` → `hallo kaka` |
+| 2 | **Pembersihan**: karakter non-alfanumerik (tanda baca, emoji, simbol) diganti spasi, spasi berlebih dirapikan | `lama!!!` → `lama` |
+| 3 | **Normalisasi jargon teknis** (regex berbatas kata) dari `resources/kamus_teknis.csv` | `144 hz` → `144Hz` |
+| 4 | **Normalisasi kata baku dan typo** per kata dari `resources/kamuskatabaku.xlsx` dan `resources/kamus_kata_baku2.csv` | `hallo` → `halo`, `ga` → `tidak` |
+
+Catatan perilaku:
+
+- Ulasan yang **kosong setelah dibersihkan** (mis. hanya emoji atau `@`) dilewati, seperti pada tahap pelatihan.
+- Teks yang ditampilkan di dasbor tetap **teks asli pengguna**; hanya model yang menerima teks hasil normalisasi.
+- Bila salah satu berkas kamus tidak ditemukan, aplikasi tetap berjalan (case folding dan pembersihan tetap dilakukan) dan menulis peringatan di log. Pastikan folder `resources/` ikut ter-*deploy*.
 
 #### 5. Pemuatan model dari Hugging Face (`get_models`)
 
@@ -156,7 +171,7 @@ Teks dibersihkan dari spasi di tepi (`strip`) dan ulasan kosong dibuang sebelum 
 #### 6. Inferensi per ulasan (`_analyze_single`)
 
 1. **ACD:** tokenisasi (maks. 128 token) → model → `sigmoid(logits)` menghasilkan 9 probabilitas independen → aspek dengan probabilitas **≥ threshold** dianggap terdeteksi.
-2. **ASC:** untuk **setiap aspek terdeteksi**, model sentimen memprediksi kelas dengan `argmax` atas `{Negatif, Netral, Positif}`.
+2. **ASC:** untuk **setiap aspek terdeteksi**, ulasan dan kode aspek dikirim sebagai **pasangan kalimat** (`[CLS] ulasan [SEP] kode_aspek [SEP]`, sama dengan format pelatihan); kelas dipilih dengan `argmax` atas `{Negatif, Netral, Positif}`.
 3. Hasil ulasan = pemetaan `aspek → sentimen`.
 
 #### 7. Agregasi hasil
@@ -170,7 +185,7 @@ Untuk seluruh ulasan, aplikasi menghitung:
 | **Aspek paling dikeluhkan** | Aspek dengan **jumlah ulasan negatif terbanyak** (seri → rasio negatif tertinggi); persentase = rasio negatif aspek tersebut |
 | Distribusi aspek | Total kemunculan tiap aspek (diagram pai) |
 | Distribusi sentimen total | Jumlah Positif / Netral / Negatif seluruh pasangan aspek–sentimen |
-| Contoh ulasan | Hingga 30 ulasan per aspek per sentimen (dipotong 220 karakter) |
+| Contoh ulasan | Hingga 30 ulasan per aspek per sentimen (teks asli, dipotong 220 karakter) |
 
 #### 8. Tampilan hasil
 
@@ -201,6 +216,10 @@ absa-streamlit-app/
 ├── utils.py            # Kode & nama aspek (A1–D1), deskripsi aspek, info model, pembuat laporan Markdown
 ├── requirements.txt    # Dependensi Python
 ├── packages.txt        # Paket sistem (Chromium & driver) untuk scraping di Streamlit Cloud
+├── resources/          # Kamus normalisasi prapemrosesan (sama dengan src/ pada repo penelitian)
+│   ├── kamuskatabaku.xlsx
+│   ├── kamus_kata_baku2.csv
+│   └── kamus_teknis.csv
 ├── .devcontainer/      # Konfigurasi dev container / Codespaces
 └── docs/               # Tangkapan layar untuk README
 ```
@@ -208,7 +227,8 @@ absa-streamlit-app/
 | Berkas | Peran |
 |---|---|
 | `app.py` | Halaman sambutan, sidebar, kolom input, status proses, kartu, grafik, dan *expander* hasil |
-| `inference.py` | `run_inference()` (titik masuk), `get_models()` (cache satu model aktif), `analyze_texts_local()`, `scrape_tokopedia_reviews()`, parser berkas, perhitungan statistik akhir |
+| `inference.py` | `run_inference()` (titik masuk), `preprocess_text()` (prapemrosesan), `get_models()` (cache satu model aktif), `analyze_texts_local()`, `scrape_tokopedia_reviews()`, parser berkas, perhitungan statistik akhir |
+| `resources/` | Tiga kamus untuk normalisasi jargon teknis, kata baku, dan typo; dibaca `preprocess_text()` |
 | `utils.py` | Kamus `ASPECTS` (kode → nama), `ASPECT_DESC`, `MODEL_INFO`, `build_report_md()` (fungsi pembuat laporan Markdown; belum dipasang ke tombol unduh di UI) |
 
 ### Sembilan aspek
@@ -299,7 +319,7 @@ Karena berjalan di CPU, siapkan memori yang cukup; aplikasi hanya menahan **satu
 
 ### Rencana pengembangan
 
-- [ ] Selaraskan input ASC dan prapemrosesan dengan skema pelatihan
+- [x] Selaraskan input ASC dan prapemrosesan dengan skema pelatihan
 - [ ] Inferensi *batch* untuk berkas besar
 - [ ] Tombol unduh laporan (Markdown/CSV)
 - [ ] Mode *joint learning* ACD+ASC untuk meredam *cascading error*
