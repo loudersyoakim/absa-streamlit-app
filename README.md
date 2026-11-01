@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🖥️ ABSA Streamlit App
+# ABSA Streamlit App
 ### Pemetaan Keluhan pada Ulasan Produk Monitor dengan Aspect-Based Sentiment Analysis (IndoBERT & mBERT)
 
 Prototipe web *proof of concept* dari skripsi **“Implementasi Aspect-Based Sentiment Analysis (ABSA) Berbasis IndoBERT untuk Pemetaan Keluhan pada Ulasan Produk Monitor”**
