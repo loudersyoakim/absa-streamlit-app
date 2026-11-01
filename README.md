@@ -12,8 +12,8 @@ Prototipe web *proof of concept* dari skripsi **“Implementasi Aspect-Based Sen
 
 [Fitur](#-fitur) · [Cara Kerja End-to-End](#-cara-kerja-end-to-end) · [Instalasi](#️-instalasi-dan-menjalankan) · [Deploy](#-deploy-ke-streamlit-community-cloud) · [Catatan Teknis](#-catatan-teknis-dan-keterbatasan)
 
-[https://absa-app-finish-louders.streamlit.app/
-]
+https://absa-app-finish-louders.streamlit.app/
+
 </div>
 
 ---
